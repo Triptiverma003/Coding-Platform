@@ -30,7 +30,7 @@ export async function register(req: Request, res: Response) {
   }
 
   if (password.length < 8) {
-    return res.status(400).json({ error: 'Password must be at least 8 characters' });
+    return res.status(400).json({ error: 'abee bhadwe theek se 8 character ka password daal na!' });
   }
 
   const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -53,12 +53,19 @@ export async function register(req: Request, res: Response) {
 
     if (error) {
       if (error.code === '23505') {
-        return res.status(409).json({ error: 'An account with this email already exists' });
+        return res.status(409).json({ error: 'chutiya hai?' });
       }
       throw new Error(error.message);
     }
 
     const token = jwt.sign({ userId: data.id }, JWT_SECRET, { expiresIn: '7d' });
+
+    res.cookie('token', token, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'strict',
+      maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days in ms
+    });
 
     return res.status(201).json({
       user: { id: data.id, email: data.email, username: data.username },
@@ -99,9 +106,17 @@ export async function login(req: Request, res: Response) {
 
     const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '7d' });
 
+    res.cookie('token', token, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'strict',
+      maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days in ms
+    });
+
     return res.status(200).json({
-      user: { id: user.id, email: user.email, username: user.username },
+      message: "chal swagat hai",
       token,
+      user: { id: user.id, email: user.email, username: user.username },
     });
   } catch (err) {
     console.error('Login error:', err instanceof Error ? err.message : err);
