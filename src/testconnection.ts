@@ -7,11 +7,11 @@ async function testConnection() {
     .limit(1);
 
   if (error) {
-    console.error('❌ Connection failed:', error.message);
+    console.error('Connection failed:', error.message);
     return;
   }
 
-  console.log('✅ Connected to Supabase successfully');
+  console.log('Connected to Supabase successfully');
   console.log('Sample data:', data);
 }
 
