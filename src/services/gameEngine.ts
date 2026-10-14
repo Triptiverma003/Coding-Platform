@@ -1,65 +1,120 @@
 import { supabase } from '../db/supabase';
 import { ExecutionResult } from './execution';
+import { invalidateRoomCache } from './roomCache';
 
-export interface SubmissionOutcome {
-  points: number;
-  allPassed: boolean;
-  isWinner: boolean;
+export const LEVELS: number[] = [1, 2, 3];
+export const MAX_LEVEL = LEVELS.length;
+
+export const levelMaxPoints = (level: number) => level * 100;
+
+export function levelStartedPayload(level: number, question: { title: string; description: string }) {
+  return {
+    level,
+    maxLevel: MAX_LEVEL,
+    maxPoints: levelMaxPoints(level),
+    title: question.title,
+    description: question.description,
+  };
 }
 
-export async function processSubmission(
+export interface PlayerProgress {
+  playerId: string;
+  currentLevel: number;
+  points: number;
+  allCleared: boolean;
+}
+
+export async function getPlayerProgress(roomId: string, userId: string): Promise<PlayerProgress | null> {
+  const { data, error } = await supabase
+    .from('players')
+    .select('id, current_level, points, all_passed')
+    .eq('room_id', roomId)
+    .eq('user_id', userId)
+    .maybeSingle();
+
+  if (error) throw new Error(error.message);
+  if (!data) return null;
+
+  return {
+    playerId: data.id,
+    currentLevel: data.current_level,
+    points: data.points,
+    allCleared: data.all_passed,
+  };
+}
+
+export type RejectionReason = 'not_a_player' | 'already_finished' | 'level_changed' | 'room_not_active';
+
+export type RecordedSubmission =
+  | { accepted: false; reason: RejectionReason }
+  | {
+      accepted: true;
+      levelPoints: number;
+      totalPoints: number;
+      levelCleared: boolean;
+      newLevel: number;
+      allCleared: boolean;
+      won: boolean;
+    };
+
+interface RecordSubmissionRow {
+  accepted: boolean;
+  reason?: RejectionReason;
+  level_points?: number;
+  total_points?: number;
+  level_cleared?: boolean;
+  new_level?: number;
+  all_cleared?: boolean;
+  won?: boolean;
+}
+
+export async function recordSubmission(
   roomId: string,
   playerId: string,
-  userId: string,
-  result: ExecutionResult
-): Promise<SubmissionOutcome> {
-  const points = Math.round((result.testCasesPassed / result.totalTestCases) * 100);
-  const allPassed = result.passed;
-
-  // Update this player's best result — only overwrite if this attempt scored higher
-  // than whatever they already had, so a worse retry can't lower their score
-  const { data: currentPlayer } = await supabase
-    .from('players')
-    .select('points')
-    .eq('id', playerId)
-    .single();
-
-  if (!currentPlayer || points > currentPlayer.points) {
-    await supabase
-      .from('players')
-      .update({
-        points,
-        test_cases_passed: result.testCasesPassed,
-        all_passed: allPassed,
-        submitted_at: new Date().toISOString(),
-      })
-      .eq('id', playerId);
-  }
-
-  // Log every attempt for the audit trail, regardless of whether it improved their score
-  await supabase.from('submissions').insert({
-    room_id: roomId,
-    player_id: playerId,
-    passed: allPassed,
-    test_cases_passed: result.testCasesPassed,
-    total_test_cases: result.totalTestCases,
+  level: number,
+  result: ExecutionResult,
+  language: string,
+  code: string
+): Promise<RecordedSubmission> {
+  const { data, error } = await supabase.rpc('record_submission', {
+    p_room_id: roomId,
+    p_player_id: playerId,
+    p_level: level,
+    p_passed: result.testCasesPassed,
+    p_total: result.totalTestCases,
+    p_language: language,
+    p_code: code,
   });
 
-  let isWinner = false;
+  if (error) throw new Error(error.message);
 
-  if (allPassed) {
-    // The atomic conditional update — same pattern as before.
-    // Whoever's "all tests passed" update lands first wins the WHERE clause race.
-    const { data: updatedRoom } = await supabase
-      .from('rooms')
-      .update({ winner_id: userId, status: 'finished', finished_at: new Date().toISOString() })
-      .eq('id', roomId)
-      .eq('status', 'active')
-      .select('id')
-      .single();
+  const row = data as RecordSubmissionRow;
 
-    isWinner = !!updatedRoom;
+  if (!row.accepted) {
+    return { accepted: false, reason: row.reason ?? 'room_not_active' };
   }
 
-  return { points, allPassed, isWinner };
+  if (row.won) await invalidateRoomCache(roomId);
+
+  return {
+    accepted: true,
+    levelPoints: row.level_points ?? 0,
+    totalPoints: row.total_points ?? 0,
+    levelCleared: row.level_cleared ?? false,
+    newLevel: row.new_level ?? level,
+    allCleared: row.all_cleared ?? false,
+    won: row.won ?? false,
+  };
+}
+
+export async function finalizeRoom(roomId: string): Promise<{ finalized: boolean; winnerId: string | null }> {
+  const { data, error } = await supabase.rpc('finalize_room', { p_room_id: roomId });
+
+  if (error) throw new Error(error.message);
+
+  const row = data as { finalized: boolean; winner_id?: string | null };
+
+  if (row.finalized) await invalidateRoomCache(roomId);
+
+  return { finalized: row.finalized, winnerId: row.winner_id ?? null };
 }

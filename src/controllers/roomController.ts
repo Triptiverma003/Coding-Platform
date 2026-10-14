@@ -1,7 +1,8 @@
 import { Response } from 'express';
 import { supabase } from '../db/supabase';
 import { AuthRequest } from '../middleware/authmiddleware';
-
+import { LEVELS } from '../services/gameEngine';
+import { startMatch } from '../services/matchTimer';
 
 function generateRoomCode(length = 6): string {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no 0/O/1/I ambiguity
@@ -14,24 +15,38 @@ function generateRoomCode(length = 6): string {
 
 export async function createRoom(req: AuthRequest, res: Response) {
   const userId = req.userId!;
-  const durationSeconds = req.body?.durationSeconds ?? 3600;
+  const requested = Number(req.body?.durationSeconds);
+  const durationSeconds = Number.isFinite(requested)
+    ? Math.min(Math.max(Math.round(requested), 300), 7200)
+    : 3600;
 
   try {
-    const { data: questions, error: qError } = await supabase
+    const { data: pool, error: poolError } = await supabase
       .from('questions')
-      .select('id')
-      .limit(50);
+      .select('id, level')
+      .in('level', LEVELS);
 
-    if (qError) throw new Error(qError.message);
-    if (!questions || questions.length === 0) {
-      return res.status(500).json({ error: 'No questions available yet' });
+    if (poolError) throw new Error(poolError.message);
+
+    const idsByLevel = new Map<number, string[]>();
+    for (const q of pool ?? []) {
+      const ids = idsByLevel.get(q.level) ?? [];
+      ids.push(q.id);
+      idsByLevel.set(q.level, ids);
     }
 
-    const question = questions[Math.floor(Math.random() * questions.length)];
-
-    if (!question) {
-  return res.status(500).json({ error: 'Failed to select a question' });
-}
+    const picks: { level: number; question_id: string }[] = [];
+    for (const level of LEVELS) {
+      const ids = idsByLevel.get(level);
+      if (!ids || ids.length === 0) {
+        return res.status(500).json({ error: `No level ${level} questions available yet` });
+      }
+      const questionId = ids[Math.floor(Math.random() * ids.length)];
+      if (!questionId) {
+        return res.status(500).json({ error: 'Failed to select a question' });
+      }
+      picks.push({ level, question_id: questionId });
+    }
 
     let room = null;
     for (let attempt = 0; attempt < 5 && !room; attempt++) {
@@ -40,7 +55,6 @@ export async function createRoom(req: AuthRequest, res: Response) {
         .from('rooms')
         .insert({
           code,
-          question_id: question.id,
           creator_id: userId,
           status: 'waiting',
           duration_seconds: durationSeconds,
@@ -49,7 +63,7 @@ export async function createRoom(req: AuthRequest, res: Response) {
         .single();
 
       if (error) {
-        if (error.code === '23505') continue; 
+        if (error.code === '23505') continue;
         throw new Error(error.message);
       }
       room = data;
@@ -58,6 +72,12 @@ export async function createRoom(req: AuthRequest, res: Response) {
     if (!room) {
       return res.status(500).json({ error: 'Could not generate a unique room code, try again' });
     }
+
+    const { error: rqError } = await supabase
+      .from('room_questions')
+      .insert(picks.map((p) => ({ room_id: room.id, ...p })));
+
+    if (rqError) throw new Error(rqError.message);
 
     const { error: playerError } = await supabase
       .from('players')
@@ -120,14 +140,14 @@ export async function joinRoom(req: AuthRequest, res: Response) {
 
     const { data: updatedRoom, error: updateError } = await supabase
       .from('rooms')
-      .update({ status: 'active', start_time: new Date().toISOString() })
+      .update({ status: 'ready' })
       .eq('id', room.id)
       .eq('status', 'waiting') // guards against a concurrent double-activation
       .select('id, code, status, start_time, duration_seconds, question_id')
       .single();
 
     if (updateError) throw new Error(updateError.message);
-
+    void startMatch(updatedRoom.id, updatedRoom.start_time, updatedRoom.duration_seconds);
     return res.status(200).json({ room: updatedRoom });
   } catch (err) {
     console.error('Join room error:', err instanceof Error ? err.message : err);

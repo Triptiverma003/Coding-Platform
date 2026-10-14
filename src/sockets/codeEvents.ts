@@ -1,79 +1,100 @@
 import { Server } from 'socket.io';
-import { supabase } from '../db/supabase';
 import { runAgainstTestCases } from '../services/execution';
-import { processSubmission } from '../services/gameEngine';
+import {
+  getPlayerProgress,
+  recordSubmission,
+  finalizeRoom,
+  levelStartedPayload,
+  RejectionReason,
+} from '../services/gameEngine';
+import { getRoomState, getLevelQuestion } from '../services/roomCache';
 import { ServerToClientEvents, ClientToServerEvents, SocketData } from '../types/socket';
 import { TypedSocket } from './socketManage';
 
 type TypedServer = Server<ClientToServerEvents, ServerToClientEvents, {}, SocketData>;
 
+const REJECTION_MESSAGES: Record<RejectionReason, string> = {
+  not_a_player: 'You are not a player in this room',
+  already_finished: 'You have already cleared every level',
+  level_changed: 'Your level changed while this was running. Submit again.',
+  room_not_active: 'The match is over or has not started',
+};
+
 export function registerCodeEvents(io: TypedServer, socket: TypedSocket) {
   socket.on('submit_code', async ({ roomId, code, language }) => {
     const userId = socket.data.userId;
 
-    const { data: player, error: playerError } = await supabase
-      .from('players')
-      .select('id')
-      .eq('room_id', roomId)
-      .eq('user_id', userId)
-      .maybeSingle();
-
-    if (playerError || !player) {
-      socket.emit('error', { message: 'You are not a player in this room' });
-      return;
-    }
-
-    const { data: room, error: roomError } = await supabase
-      .from('rooms')
-      .select('question_id, status')
-      .eq('id', roomId)
-      .single();
-
-    if (roomError || !room) {
-      socket.emit('error', { message: 'Room not found' });
-      return;
-    }
-
-    if (room.status !== 'active') {
-      socket.emit('error', { message: 'This room is not currently active' });
-      return;
-    }
-
-    const { data: question, error: qError } = await supabase
-      .from('questions')
-      .select('test_cases')
-      .eq('id', room.question_id)
-      .single();
-
-    if (qError || !question) {
-      socket.emit('error', { message: 'Could not load question for this room' });
-      return;
-    }
-
     try {
-      const result = await runAgainstTestCases(code, language, question.test_cases);
-      const outcome = await processSubmission(roomId, player.id, userId, result);
+      const progress = await getPlayerProgress(roomId, userId);
+      if (!progress) {
+        socket.emit('error', { message: REJECTION_MESSAGES.not_a_player });
+        return;
+      }
+      if (progress.allCleared) {
+        socket.emit('error', { message: REJECTION_MESSAGES.already_finished });
+        return;
+      }
 
-      // Tell the submitting player their own detailed result
-      socket.emit('opponent_submitted', {
-        passed: outcome.allPassed,
+      const room = await getRoomState(roomId);
+      if (!room || room.status !== 'active' || !room.startTime || !room.durationSeconds) {
+        socket.emit('error', { message: REJECTION_MESSAGES.room_not_active });
+        return;
+      }
+
+      const endsAt = new Date(room.startTime).getTime() + room.durationSeconds * 1000;
+      if (Date.now() >= endsAt) {
+        const fin = await finalizeRoom(roomId);
+        if (fin.finalized) io.to(roomId).emit('room_finished', { winnerId: fin.winnerId });
+        socket.emit('error', { message: 'Time is up' });
+        return;
+      }
+
+      // The server decides the level, never the client
+      const question = await getLevelQuestion(roomId, progress.currentLevel);
+      if (!question) {
+        socket.emit('error', { message: 'Could not load the question for your level' });
+        return;
+      }
+
+      const result = await runAgainstTestCases(code, language, question.testCases);
+      const outcome = await recordSubmission(roomId, progress.playerId, progress.currentLevel, result, language, code);
+
+      if (!outcome.accepted) {
+        if (outcome.reason === 'room_not_active') {
+          const fin = await finalizeRoom(roomId);
+          if (fin.finalized) io.to(roomId).emit('room_finished', { winnerId: fin.winnerId });
+        }
+        socket.emit('error', { message: REJECTION_MESSAGES[outcome.reason] });
+        return;
+      }
+
+      socket.emit('submission_result', {
+        level: progress.currentLevel,
         testCasesPassed: result.testCasesPassed,
         totalTestCases: result.totalTestCases,
+        levelPoints: outcome.levelPoints,
+        totalPoints: outcome.totalPoints,
+        levelCleared: outcome.levelCleared,
       });
 
-      // Tell everyone else in the room that someone submitted (without leaking their code)
-      socket.to(roomId).emit('opponent_submitted', {
-        passed: outcome.allPassed,
-        testCasesPassed: result.testCasesPassed,
-        totalTestCases: result.totalTestCases,
+      socket.to(roomId).emit('opponent_progress', {
+        level: outcome.newLevel,
+        totalPoints: outcome.totalPoints,
+        levelCleared: outcome.levelCleared,
       });
 
-      if (outcome.isWinner) {
+      if (outcome.won) {
         io.to(roomId).emit('room_finished', { winnerId: userId });
+        return;
+      }
+
+      if (outcome.levelCleared && !outcome.allCleared) {
+        const next = await getLevelQuestion(roomId, outcome.newLevel);
+        if (next) socket.emit('level_started', levelStartedPayload(outcome.newLevel, next));
       }
     } catch (err) {
-      socket.emit('error', { message: 'Code execution failed. Please try again.' });
       console.error('Submission error:', err instanceof Error ? err.message : err);
+      socket.emit('error', { message: 'Code execution failed. Please try again.' });
     }
   });
 }

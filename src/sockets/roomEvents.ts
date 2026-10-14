@@ -1,7 +1,9 @@
 import { Server } from 'socket.io';
-import { supabase } from '../db/supabase';
 import { ServerToClientEvents, ClientToServerEvents, SocketData } from '../types/socket';
 import { TypedSocket } from './socketManage';
+import { getVerifiedRoomPlayers, getRoomState } from '../services/roomCache';
+import { getLevelQuestion } from '../services/roomCache';
+import { getPlayerProgress, levelStartedPayload } from '../services/gameEngine';
 
 type TypedServer = Server<ClientToServerEvents, ServerToClientEvents, {}, SocketData>;
 
@@ -9,44 +11,35 @@ export function registerRoomEvents(io: TypedServer, socket: TypedSocket) {
   socket.on('join_room', async ({ roomId }) => {
     const userId = socket.data.userId;
 
-    // Confirm this user is actually a player in this room before letting them into the channel
-    const { data: player, error } = await supabase
-      .from('players')
-      .select('id')
-      .eq('room_id', roomId)
-      .eq('user_id', userId)
-      .maybeSingle();
-
-    if (error || !player) {
-      socket.emit('error', { message: 'You are not a player in this room' });
-      return;
+    const progress = await getPlayerProgress(roomId, userId);
+    if (progress && !progress.allCleared) {
+      const question = await getLevelQuestion(roomId, progress.currentLevel);
+    if (question) socket.emit('level_started', levelStartedPayload(progress.currentLevel, question));
     }
 
-    socket.join(roomId);
+    try {
+      const playerIds = await getVerifiedRoomPlayers(roomId, userId);
 
-    const { data: allPlayers } = await supabase
-      .from('players')
-      .select('user_id')
-      .eq('room_id', roomId);
+      if (!playerIds) {
+        socket.emit('error', { message: 'You are not a player in this room' });
+        return;
+      }
 
-    io.to(roomId).emit('player_joined', {
-      userId,
-      totalPlayers: allPlayers?.length ?? 0,
-    });
+      socket.join(roomId);
 
-    // If the room is already active (both players present), tell this socket
-    // the timer info immediately — covers reconnects and the 2nd player joining sockets slightly late
-    const { data: room } = await supabase
-      .from('rooms')
-      .select('status, start_time, duration_seconds')
-      .eq('id', roomId)
-      .single();
+      io.to(roomId).emit('player_joined', { userId, totalPlayers: playerIds.length });
 
-    if (room?.status === 'active' && room.start_time && room.duration_seconds) {
-      socket.emit('timer_started', {
-        startTime: room.start_time,
-        durationSeconds: room.duration_seconds,
-      });
+      // Covers reconnects and a 2nd player whose socket connects slightly late
+      const room = await getRoomState(roomId);
+      if (room?.status === 'active' && room.startTime && room.durationSeconds) {
+        socket.emit('timer_started', {
+          startTime: room.startTime,
+          durationSeconds: room.durationSeconds,
+        });
+      }
+    } catch (err) {
+      console.error('join_room error:', err instanceof Error ? err.message : err);
+      socket.emit('error', { message: 'Could not join room. Please try again.' });
     }
   });
 }

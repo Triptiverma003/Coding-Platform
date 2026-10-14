@@ -54,8 +54,11 @@ async function runTest() {
   socketA.on('timer_started', (data) => console.log('[A] timer_started:', data));
   socketB.on('timer_started', (data) => console.log('[B] timer_started:', data));
 
-  socketA.on('opponent_submitted', (data) => console.log('[A] opponent_submitted event:', data));
-  socketB.on('opponent_submitted', (data) => console.log('[B] opponent_submitted event:', data));
+  for (const [name, s] of [['A', socketA], ['B', socketB]] as const) {
+  s.on('level_started', (d) => console.log(`[${name}] level_started:`, d.level, d.title));
+  s.on('submission_result', (d) => console.log(`[${name}] submission_result:`, d));
+  s.on('opponent_progress', (d) => console.log(`[${name}] opponent_progress:`, d));
+}
 
   socketA.on('room_finished', (data) => console.log('[A] room_finished:', data));
   socketB.on('room_finished', (data) => console.log('[B] room_finished:', data));

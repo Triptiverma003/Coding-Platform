@@ -7,9 +7,10 @@ import authRoutes from './routes/authRoutes';
 import cookieParser from 'cookie-parser';
 import roomRoutes from './routes/roomRoutes';
 import { initSocketManager} from './sockets/socketManage';
+import { connectRedis } from './db/redis';
+import { redisClient } from './db/redis';
 
 dotenv.config();
-
 const app = express();
 app.use(express.json());
 app.use(cookieParser());
@@ -47,7 +48,8 @@ async function checkDatabaseConnection(): Promise<void> {
 
 async function startServer() {
   await checkDatabaseConnection();
-
+  await connectRedis();
+  console.log("redis is connected and ready for caching");
   httpServer.listen(PORT, () => {
     console.log(`Server is running on ${PORT}!`);
   });
